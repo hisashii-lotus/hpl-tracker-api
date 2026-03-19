@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
@@ -13,10 +12,7 @@ SUMMONER_TAG = "NA1"
 REGION = "na1"
 REGIONAL = "americas"
 
-RIOT_ACCOUNT_API = f"https://{REGIONAL}.api.riotgames.com"
-RIOT_PLATFORM_API = f"https://{REGION}.api.riotgames.com"
-
-app = FastAPI(title="HPL Tracker API", version="2.1.0")
+app = FastAPI(title="HPL Tracker API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,107 +22,107 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class State:
-    puuid: Optional[str] = None
-    cached_matches: List[dict] = []
-    cache_time: Optional[datetime] = None
+puuid_cache = None
+match_cache = []
+cache_time = None
 
-state = State()
-
-async def riot_request(url: str) -> Optional[dict]:
+async def riot_get(url):
     if not RIOT_API_KEY:
         return None
     headers = {"X-Riot-Token": RIOT_API_KEY}
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:
+            r = await client.get(url, headers=headers)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
                 await asyncio.sleep(2)
-                return await riot_request(url)
-            return None
+                return await riot_get(url)
         except:
-            return None
+            pass
+    return None
 
-async def get_puuid() -> Optional[str]:
-    if state.puuid:
-        return state.puuid
-    url = f"{RIOT_ACCOUNT_API}/riot/account/v1/accounts/by-riot-id/{SUMMONER_NAME}/{SUMMONER_TAG}"
-    data = await riot_request(url)
+async def get_puuid():
+    global puuid_cache
+    if puuid_cache:
+        return puuid_cache
+    url = f"https://{REGIONAL}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{SUMMONER_NAME}/{SUMMONER_TAG}"
+    data = await riot_get(url)
     if data:
-        state.puuid = data["puuid"]
-    return state.puuid
+        puuid_cache = data["puuid"]
+    return puuid_cache
 
-async def get_match_ids(puuid: str, count: int = 10) -> List[str]:
-    url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/by-puuid/{puuid}/ids?count={count}&queue=420"
-    return await riot_request(url) or []
+async def get_matches(puuid, count=5):
+    url = f"https://{REGIONAL}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?count={count}&queue=420"
+    return await riot_get(url) or []
 
-async def get_match(match_id: str) -> Optional[dict]:
-    url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/{match_id}"
-    return await riot_request(url)
+async def get_match(match_id):
+    url = f"https://{REGIONAL}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+    return await riot_get(url)
 
-async def get_timeline(match_id: str) -> Optional[dict]:
-    url = f"{RIOT_ACCOUNT_API}/lol/match/v5/matches/{match_id}/timeline"
-    return await riot_request(url)
+async def get_timeline(match_id):
+    url = f"https://{REGIONAL}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
+    return await riot_get(url)
 
-def extract_player(match: dict, puuid: str) -> Optional[dict]:
-    participants = match.get("info", {}).get("participants", [])
-    player = next((p for p in participants if p.get("puuid") == puuid), None)
-    if not player:
-        return None
-    duration = match["info"]["gameDuration"]
-    mins, secs = duration // 60, duration % 60
-    return {
-        "matchId": match["metadata"]["matchId"],
-        "win": player["win"],
-        "kills": player["kills"],
-        "deaths": player["deaths"],
-        "assists": player["assists"],
-        "champion": player["championName"],
-        "cs": player["totalMinionsKilled"] + player.get("neutralMinionsKilled", 0),
-        "duration": f"{mins}:{secs:02d}",
-        "durationMins": mins
-    }
+def extract_player(match, puuid):
+    for p in match.get("info", {}).get("participants", []):
+        if p.get("puuid") == puuid:
+            dur = match["info"]["gameDuration"]
+            return {
+                "matchId": match["metadata"]["matchId"],
+                "win": p["win"],
+                "kills": p["kills"],
+                "deaths": p["deaths"],
+                "assists": p["assists"],
+                "champion": p["championName"],
+                "cs": p["totalMinionsKilled"] + p.get("neutralMinionsKilled", 0),
+                "duration": f"{dur//60}:{dur%60:02d}"
+            }
+    return None
 
-def get_death_timings(timeline: dict, puuid: str, match: dict) -> List[int]:
+def get_deaths(timeline, puuid, match):
     deaths = []
-    participants = match.get("info", {}).get("participants", [])
-    player = next((p for p in participants if p.get("puuid") == puuid), None)
-    if not player:
+    pid = None
+    for p in match.get("info", {}).get("participants", []):
+        if p.get("puuid") == puuid:
+            pid = p.get("participantId")
+            break
+    if not pid:
         return deaths
-    pid = player.get("participantId")
     for frame in timeline.get("info", {}).get("frames", []):
-        for event in frame.get("events", []):
-            if event.get("type") == "CHAMPION_KILL" and event.get("victimId") == pid:
-                deaths.append(event.get("timestamp", 0) // 60000)
+        for e in frame.get("events", []):
+            if e.get("type") == "CHAMPION_KILL" and e.get("victimId") == pid:
+                deaths.append(e.get("timestamp", 0) // 60000)
     return deaths
 
-def calc_heatmap(games: List[dict]) -> Dict[str, float]:
-    brackets = {"0-5": 0, "5-10": 0, "10-15": 0, "15-20": 0, "20+": 0}
+def calc_heatmap(games):
+    b = {"0-5": 0, "5-10": 0, "10-15": 0, "15-20": 0, "20+": 0}
     for g in games:
         for d in g.get("deathTimings", []):
-            if d < 5: brackets["0-5"] += 1
-            elif d < 10: brackets["5-10"] += 1
-            elif d < 15: brackets["10-15"] += 1
-            elif d < 20: brackets["15-20"] += 1
-            else: brackets["20+"] += 1
+            if d < 5:
+                b["0-5"] += 1
+            elif d < 10:
+                b["5-10"] += 1
+            elif d < 15:
+                b["10-15"] += 1
+            elif d < 20:
+                b["15-20"] += 1
+            else:
+                b["20+"] += 1
     n = max(len(games), 1)
-    return {k: round(v/n, 2) for k, v in brackets.items()}
+    return {k: round(v/n, 2) for k, v in b.items()}
 
-def get_patterns(games: List[dict], heatmap: Dict[str, float]) -> List[dict]:
+def get_patterns(heatmap):
     patterns = []
     if heatmap.get("10-15", 0) > 1.0:
-        patterns.append({"id": "mid", "title": "Mid-Game Deaths", "severity": "high", "description": f"{heatmap['10-15']} deaths avg 10-15 min", "action": "Ward river before roaming"})
+        patterns.append({"title": "Mid-Game Deaths", "severity": "high", "description": f"{heatmap['10-15']} deaths 10-15min", "action": "Ward river before roaming"})
     if heatmap.get("20+", 0) > 1.2:
-        patterns.append({"id": "late", "title": "Late Game Positioning", "severity": "high" if heatmap["20+"] > 2 else "medium", "description": f"{heatmap['20+']} deaths avg 20+ min", "action": "Wait 2s before entering fights"})
-    if heatmap.get("0-5", 0) + heatmap.get("5-10", 0) < 0.8:
-        patterns.append({"id": "early", "title": "Early Game Consistency", "severity": "low", "description": "Low early deaths", "action": "Keep respecting jungle timers"})
+        patterns.append({"title": "Late Game Deaths", "severity": "medium", "description": f"{heatmap['20+']} deaths 20+min", "action": "Wait 2s before fights"})
     return patterns
 
 @app.get("/")
 async def root():
-    return {"name": "HPL Tracker API", "status": "online", "summoner": f"{SUMMONER_NAME}#{SUMMONER_TAG}"}
+    return {"name": "HPL Tracker", "status": "online"}
 
 @app.get("/api/health")
 async def health():
@@ -134,29 +130,32 @@ async def health():
 
 @app.get("/api/dashboard")
 async def dashboard():
+    global match_cache, cache_time
+    
     puuid = await get_puuid()
     if not puuid:
-        return {"error": "Account not found"}
+        return {"error": "Account not found", "games": []}
     
-    if state.cache_time and datetime.now() - state.cache_time < timedelta(seconds=30) and state.cached_matches:
-        games = state.cached_matches
+    now = datetime.now()
+    if cache_time and (now - cache_time).seconds < 30 and match_cache:
+        games = match_cache
     else:
-        match_ids = await get_match_ids(puuid, 5)
+        match_ids = await get_matches(puuid, 5)
         games = []
         for mid in match_ids:
             match = await get_match(mid)
             if match:
                 player = extract_player(match, puuid)
                 if player:
-                    timeline = await get_timeline(mid)
-                    player["deathTimings"] = get_death_timings(timeline, puuid, match) if timeline else []
+                    tl = await get_timeline(mid)
+                    player["deathTimings"] = get_deaths(tl, puuid, match) if tl else []
                     games.append(player)
             await asyncio.sleep(0.1)
-        state.cached_matches = games
-        state.cache_time = datetime.now()
+        match_cache = games
+        cache_time = now
     
     if not games:
-        return {"games": [], "deathTimings": {}, "patterns": [], "winRate": 0, "avgDeaths": 0}
+        return {"games": [], "deathTimings": {}, "patterns": [], "winRate": 0, "avgDeaths": 0, "status": "READY"}
     
     wins = sum(1 for g in games if g["win"])
     deaths = sum(g["deaths"] for g in games)
@@ -165,21 +164,8 @@ async def dashboard():
     return {
         "games": games,
         "deathTimings": heatmap,
-        "patterns": get_patterns(games, heatmap),
+        "patterns": get_patterns(heatmap),
         "winRate": round(wins/len(games)*100, 1),
         "avgDeaths": round(deaths/len(games), 1),
         "status": "READY"
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-```
-
----
-
-## File 2: `requirements.txt`
-```
-fastapi==0.109.0
-uvicorn==0.27.0
-httpx==0.26.0
