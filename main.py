@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
@@ -7,9 +7,6 @@ from typing import Optional, List, Dict
 import os
 
 RIOT_API_KEY = os.getenv("RIOT_API_KEY", "")
-SUMMONER_NAME = "Hisashii"
-SUMMONER_TAG = "NA1"
-REGION = "na1"
 REGIONAL = "americas"
 
 app = FastAPI(title="HPL Tracker API")
@@ -22,9 +19,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-puuid_cache = None
-match_cache = []
-cache_time = None
+# Cache per summoner
+cache = {}
 
 async def riot_get(url):
     if not RIOT_API_KEY:
@@ -42,15 +38,10 @@ async def riot_get(url):
             pass
     return None
 
-async def get_puuid():
-    global puuid_cache
-    if puuid_cache:
-        return puuid_cache
-    url = f"https://{REGIONAL}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{SUMMONER_NAME}/{SUMMONER_TAG}"
+async def get_puuid(name: str, tag: str):
+    url = f"https://{REGIONAL}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{name}/{tag}"
     data = await riot_get(url)
-    if data:
-        puuid_cache = data["puuid"]
-    return puuid_cache
+    return data.get("puuid") if data else None
 
 async def get_matches(puuid, count=5):
     url = f"https://{REGIONAL}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?count={count}&queue=420"
@@ -122,46 +113,53 @@ def get_patterns(heatmap):
 
 @app.get("/")
 async def root():
-    return {"name": "HPL Tracker", "status": "online"}
+    return {"name": "HPL Tracker", "status": "online", "version": "2.0", "note": "Add ?summoner=Name&tag=NA1 to /api/dashboard"}
 
 @app.get("/api/health")
 async def health():
     return {"status": "healthy", "apiKeySet": bool(RIOT_API_KEY)}
 
 @app.get("/api/dashboard")
-async def dashboard():
-    global match_cache, cache_time
-    
-    puuid = await get_puuid()
-    if not puuid:
-        return {"error": "Account not found", "games": []}
-    
+async def dashboard(
+    summoner: str = Query(default="Hisashii", description="Summoner name"),
+    tag: str = Query(default="NA1", description="Tag (e.g., NA1, EUW)")
+):
+    cache_key = f"{summoner}#{tag}".lower()
     now = datetime.now()
-    if cache_time and (now - cache_time).seconds < 30 and match_cache:
-        games = match_cache
-    else:
-        match_ids = await get_matches(puuid, 5)
-        games = []
-        for mid in match_ids:
-            match = await get_match(mid)
-            if match:
-                player = extract_player(match, puuid)
-                if player:
-                    tl = await get_timeline(mid)
-                    player["deathTimings"] = get_deaths(tl, puuid, match) if tl else []
-                    games.append(player)
-            await asyncio.sleep(0.1)
-        match_cache = games
-        cache_time = now
+    
+    # Check cache (30 second TTL)
+    if cache_key in cache:
+        cached = cache[cache_key]
+        if (now - cached["time"]).seconds < 30:
+            return cached["data"]
+    
+    # Get PUUID
+    puuid = await get_puuid(summoner, tag)
+    if not puuid:
+        return {"error": f"Account not found: {summoner}#{tag}", "games": []}
+    
+    # Fetch matches
+    match_ids = await get_matches(puuid, 5)
+    games = []
+    for mid in match_ids:
+        match = await get_match(mid)
+        if match:
+            player = extract_player(match, puuid)
+            if player:
+                tl = await get_timeline(mid)
+                player["deathTimings"] = get_deaths(tl, puuid, match) if tl else []
+                games.append(player)
+        await asyncio.sleep(0.1)
     
     if not games:
-        return {"games": [], "deathTimings": {}, "patterns": [], "winRate": 0, "avgDeaths": 0, "status": "READY"}
+        return {"games": [], "summoner": f"{summoner}#{tag}", "deathTimings": {}, "patterns": [], "winRate": 0, "avgDeaths": 0, "status": "READY"}
     
     wins = sum(1 for g in games if g["win"])
     deaths = sum(g["deaths"] for g in games)
     heatmap = calc_heatmap(games)
     
-    return {
+    result = {
+        "summoner": f"{summoner}#{tag}",
         "games": games,
         "deathTimings": heatmap,
         "patterns": get_patterns(heatmap),
@@ -169,3 +167,8 @@ async def dashboard():
         "avgDeaths": round(deaths/len(games), 1),
         "status": "READY"
     }
+    
+    # Cache result
+    cache[cache_key] = {"time": now, "data": result}
+    
+    return result
